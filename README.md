@@ -31,14 +31,15 @@ examples/adc_controller.csv
 
 The table format is:
 
-```csv
-module_name,clock,reset,reset_active_low,reset_state,inputs,output_defaults,state,condition,next_state,outputs
-my_fsm,clk,rst_n,true,IDLE,start;done,out_valid=1'b0;busy=1'b0,IDLE,start,RUN,busy=1'b1
-,,,,,,,IDLE,default,IDLE,
-,,,,,,,RUN,done,DONE,out_valid=1'b1
-,,,,,,,RUN,default,RUN,busy=1'b1
-,,,,,,,DONE,default,IDLE,
-```
+| module_name | clock | reset | reset_active_low | reset_state | inputs | output_defaults | state | condition | next_state | outputs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| my_fsm | clk | rst_n | true | IDLE | start;done | out_valid=1'b0;busy=1'b0 | IDLE | start | RUN | busy=1'b1 |
+|  |  |  |  |  |  |  | IDLE | default | IDLE |  |
+|  |  |  |  |  |  |  | RUN | done | DONE | out_valid=1'b1 |
+|  |  |  |  |  |  |  | RUN | default | RUN | busy=1'b1 |
+|  |  |  |  |  |  |  | DONE | default | IDLE |  |
+
+In the actual CSV file, each row is saved as comma-separated values. Blank cells are allowed after the first data row.
 
 Only the first data row needs `module_name`, `clock`, `reset`, `inputs`, and `output_defaults`. The rows after that can leave those columns blank.
 
