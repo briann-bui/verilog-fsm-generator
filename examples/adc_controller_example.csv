@@ -1,0 +1,12 @@
+module_name,clock,reset,reset_active_low,reset_state,inputs,output_defaults,state,condition,next_state,outputs
+adc_controller_fsm,clk,rst_n,true,IDLE,start;eoc;timeout;fifo_full,adc_cs_n=1'b1;adc_start=1'b0;sample_valid=1'b0;fifo_wr=1'b0;error=1'b0;busy=1'b0,IDLE,start,START_CONV,adc_cs_n=1'b0;adc_start=1'b1;busy=1'b1
+,,,,,,,IDLE,default,IDLE,
+,,,,,,,START_CONV,default,WAIT_EOC,adc_cs_n=1'b0;busy=1'b1
+,,,,,,,WAIT_EOC,eoc && !fifo_full,READ_SAMPLE,adc_cs_n=1'b0;busy=1'b1
+,,,,,,,WAIT_EOC,eoc && fifo_full,ERROR,error=1'b1
+,,,,,,,WAIT_EOC,timeout,ERROR,error=1'b1
+,,,,,,,WAIT_EOC,default,WAIT_EOC,adc_cs_n=1'b0;busy=1'b1
+,,,,,,,READ_SAMPLE,default,WRITE_FIFO,sample_valid=1'b1;busy=1'b1
+,,,,,,,WRITE_FIFO,default,DONE,fifo_wr=1'b1;busy=1'b1
+,,,,,,,DONE,default,IDLE,
+,,,,,,,ERROR,default,IDLE,error=1'b1

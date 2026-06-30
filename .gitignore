@@ -1,0 +1,6 @@
+__pycache__/
+generated*/
+sim_check/
+csrc/
+simv*
+*.pyc

@@ -1,0 +1,9 @@
+module_name,clock,reset,reset_active_low,reset_state,inputs,output_defaults,state,condition,next_state,outputs
+traffic_light_fsm,clk,rst_n,true,IDLE,start;timer_done,green=1'b0;yellow=1'b0;red=1'b0;timer_load=1'b0,IDLE,start,GREEN,green=1'b1;timer_load=1'b1
+,,,,,,,IDLE,default,IDLE,
+,,,,,,,GREEN,timer_done,YELLOW,yellow=1'b1;timer_load=1'b1
+,,,,,,,GREEN,default,GREEN,green=1'b1
+,,,,,,,YELLOW,timer_done,RED,red=1'b1;timer_load=1'b1
+,,,,,,,YELLOW,default,YELLOW,yellow=1'b1
+,,,,,,,RED,timer_done,GREEN,green=1'b1;timer_load=1'b1
+,,,,,,,RED,default,RED,red=1'b1

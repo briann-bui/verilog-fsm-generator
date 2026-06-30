@@ -1,0 +1,6 @@
+module_name,clock,reset,reset_active_low,reset_state,inputs,output_defaults,state,condition,next_state,outputs
+,,,,,,,,,,
+,,,,,,,,,,
+,,,,,,,,,,
+,,,,,,,,,,
+,,,,,,,,,,
