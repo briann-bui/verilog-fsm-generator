@@ -5,7 +5,7 @@ Generate a Verilog FSM from one CSV table or one sheet in an XLSX workbook.
 ## Quick Start
 
 ```sh
-cd /home/nhutbm/WorkSpace/GITHUB/IP_OWNER/FSM_Generator
+cd /FSM_Generator
 make gen
 ```
 
