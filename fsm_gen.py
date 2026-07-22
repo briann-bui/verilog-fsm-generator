@@ -12,7 +12,32 @@ from typing import Dict, Iterable, List, Optional, Tuple
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
 
-DEFAULT_TEMPLATE = """\
+DEFAULT_SYSTEMVERILOG_TEMPLATE = """\
+`default_nettype none
+
+module {{module_name}} (
+{{port_declarations}}
+);
+
+{{state_declarations}}
+
+{{timer_declarations}}
+
+{{state_register_block}}
+
+{{timer_block}}
+
+{{comb_block}}
+
+{{assertion_block}}
+
+endmodule
+
+`default_nettype wire
+"""
+
+
+DEFAULT_VERILOG_TEMPLATE = """\
 module {{module_name}} (
 {{port_declarations}}
 );
@@ -22,12 +47,20 @@ module {{module_name}} (
 reg [STATE_W-1:0] {{state_reg_name}};
 reg [STATE_W-1:0] {{next_state_name}};
 
+{{timer_declarations}}
+
 {{state_register_block}}
+
+{{timer_block}}
 
 {{comb_block}}
 
 endmodule
 """
+
+
+# Kept as a public alias for callers that imported the old constant.
+DEFAULT_TEMPLATE = DEFAULT_SYSTEMVERILOG_TEMPLATE
 
 
 @dataclass
@@ -56,6 +89,7 @@ class State:
     raw_name: str
     ident: str
     code: Optional[str] = None
+    timer_limit: Optional[str] = None
 
 
 @dataclass
@@ -88,48 +122,6 @@ def die(message: str) -> None:
 
 def warn(message: str) -> None:
     print(f"WARNING: {message}", file=sys.stderr)
-
-
-ADC_TEMPLATE_HEADERS = [
-    "module_name",
-    "clock",
-    "reset",
-    "reset_active_low",
-    "reset_state",
-    "inputs",
-    "output_defaults",
-    "state",
-    "condition",
-    "next_state",
-    "outputs",
-]
-
-
-ADC_TEMPLATE_ROWS = [
-    [
-        "adc_controller_fsm",
-        "clk",
-        "rst_n",
-        "true",
-        "IDLE",
-        "start;eoc;timeout;fifo_full",
-        "adc_cs_n=1'b1;adc_start=1'b0;sample_valid=1'b0;fifo_wr=1'b0;error=1'b0;busy=1'b0",
-        "IDLE",
-        "start",
-        "START_CONV",
-        "adc_cs_n=1'b0;adc_start=1'b1;busy=1'b1",
-    ],
-    ["", "", "", "", "", "", "", "IDLE", "default", "IDLE", ""],
-    ["", "", "", "", "", "", "", "START_CONV", "default", "WAIT_EOC", "adc_cs_n=1'b0;busy=1'b1"],
-    ["", "", "", "", "", "", "", "WAIT_EOC", "eoc && !fifo_full", "READ_SAMPLE", "adc_cs_n=1'b0;busy=1'b1"],
-    ["", "", "", "", "", "", "", "WAIT_EOC", "eoc && fifo_full", "ERROR", "error=1'b1"],
-    ["", "", "", "", "", "", "", "WAIT_EOC", "timeout", "ERROR", "error=1'b1"],
-    ["", "", "", "", "", "", "", "WAIT_EOC", "default", "WAIT_EOC", "adc_cs_n=1'b0;busy=1'b1"],
-    ["", "", "", "", "", "", "", "READ_SAMPLE", "default", "WRITE_FIFO", "sample_valid=1'b1;busy=1'b1"],
-    ["", "", "", "", "", "", "", "WRITE_FIFO", "default", "DONE", "fifo_wr=1'b1;busy=1'b1"],
-    ["", "", "", "", "", "", "", "DONE", "default", "IDLE", ""],
-    ["", "", "", "", "", "", "", "ERROR", "default", "IDLE", "error=1'b1"],
-]
 
 
 def read_csv_rows(path: Path) -> List[Dict[str, str]]:
@@ -205,64 +197,197 @@ def read_xlsx_sheets(path: Path) -> Tuple[Dict[str, List[Dict[str, str]]], Optio
     return sheets, template
 
 
-def create_adc_template(path: Path) -> None:
+def create_fsm_template(path: Path) -> None:
     try:
         import openpyxl
-        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.formatting.rule import FormulaRule
+        from openpyxl.comments import Comment
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.worksheet.datavalidation import DataValidation
         from openpyxl.utils import get_column_letter
+        from openpyxl.workbook.defined_name import DefinedName
     except ImportError:
         die("Creating .xlsx templates needs openpyxl. Install with: python3 -m pip install openpyxl")
 
     wb = openpyxl.Workbook()
-    ws_help = wb.active
-    ws_help.title = "template"
-    help_rows = [
-        ["ADC Controller FSM Template"],
-        ["Sheet nay la huong dan. Generator se bo qua sheet nay va doc sheet adc_controller."],
-        ["Chi can sua bang trong sheet adc_controller de tao FSM Verilog."],
-        [""],
-        ["Cot", "Y nghia", "Vi du"],
-        ["module_name", "Ten module Verilog. Chi can dien o dong dau.", "adc_controller_fsm"],
-        ["clock", "Ten clock input.", "clk"],
-        ["reset", "Ten reset input.", "rst_n"],
-        ["reset_active_low", "true neu reset active-low, false neu active-high.", "true"],
-        ["reset_state", "State reset. Neu de trong se dung state dau tien.", "IDLE"],
-        ["inputs", "Danh sach input cach nhau bang dau ;. Bus dung name:width.", "start;eoc;timeout;fifo_full;channel_sel:3"],
-        ["output_defaults", "Output default moi chu ky, cach nhau bang dau ;.", "adc_cs_n=1'b1;busy=1'b0"],
-        ["state", "Current state.", "WAIT_EOC"],
-        ["condition", "Dieu kien chuyen state. Dung default cho nhanh else.", "eoc && !fifo_full"],
-        ["next_state", "Next state.", "READ_SAMPLE"],
-        ["outputs", "Output override cho branch do, cach nhau bang dau ;.", "sample_valid=1'b1;fifo_wr=1'b1"],
-        [""],
-        ["Lenh gen"],
-        [f"python3 fsm_gen.py {path.name} -o generated"],
+    guide = wb.active
+    guide.title = "Guide"
+    config = wb.create_sheet("Config")
+    inputs = wb.create_sheet("Inputs")
+    outputs = wb.create_sheet("Outputs")
+    states = wb.create_sheet("States")
+    transitions = wb.create_sheet("Transitions")
+
+    guide_rows = [
+        ["SYSTEMVERILOG FSM GENERATOR", "Workbook source for one generated FSM"],
+        ["Quick workflow", "1. Edit Config  2. Add Inputs/Outputs  3. Add States  4. Add Transitions  5. Run make gen"],
+        ["Important", "Yellow cells are user-editable. Do not rename sheets or header columns."],
+        ["Transition priority", "Rows are evaluated from top to bottom. Put the highest-priority condition first and default last."],
+        ["State timing", "Set timer_limit in States, then use timer_done in a transition condition."],
+        ["Bus width", "Enter width as a number: 1, 4, 8, 16, 32. Width 1 generates a scalar."],
+        ["Outputs", "Defaults come from Outputs. Branch overrides use name=value separated by semicolons."],
+        ["Generate", f"python3 fsm_gen.py {path.name} -o generated"],
+        ["Documentation", "See docs/USER_GUIDE.md for complete rules and troubleshooting."],
     ]
-    for row in help_rows:
-        ws_help.append(row)
+    for row in guide_rows:
+        guide.append(row)
 
-    ws_help["A1"].font = Font(bold=True, size=14)
-    ws_help["A1"].fill = PatternFill("solid", fgColor="D9EAF7")
-    for cell in ws_help[5]:
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill("solid", fgColor="E2F0D9")
-    for idx, width in enumerate([24, 76, 52], start=1):
-        ws_help.column_dimensions[get_column_letter(idx)].width = width
+    config.append(["key", "value", "description"])
+    config_rows = [
+        ["module_name", "timed_controller_fsm", "Generated RTL module name"],
+        ["language", "systemverilog", "systemverilog (recommended) or verilog"],
+        ["clock", "clk", "Clock input name"],
+        ["reset", "rst_n", "Reset input name"],
+        ["reset_active_low", "true", "true: active-low; false: active-high"],
+        ["reset_type", "async", "async or sync reset implementation"],
+        ["reset_state", "IDLE", "State selected after reset"],
+        ["encoding", "binary", "binary, onehot, or gray automatic state encoding"],
+        ["state_reg_name", "state", "Internal current-state register"],
+        ["next_state_name", "next_state", "Internal next-state signal"],
+        ["timer_width", "8", "Shared state-timer width"],
+        ["clock_enable", "", "Optional FSM/timer clock-enable input name"],
+        ["assertions", "true", "Emit simulation-only SystemVerilog assertions"],
+    ]
+    for row in config_rows:
+        config.append(row)
 
-    ws_data = wb.create_sheet("adc_controller")
-    ws_data.append(ADC_TEMPLATE_HEADERS)
-    for row in ADC_TEMPLATE_ROWS:
-        ws_data.append(row)
-    for cell in ws_data[1]:
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill("solid", fgColor="FFF2CC")
-    widths = [24, 10, 10, 18, 16, 38, 96, 18, 28, 18, 80]
-    for idx, width in enumerate(widths, start=1):
-        ws_data.column_dimensions[get_column_letter(idx)].width = width
+    inputs.append(["name", "width", "description"])
+    for row in [
+        ["start", "1", "Start the sequence"],
+        ["abort", "1", "Return to error/idle path"],
+        ["delay_cycles", "8", "Programmable WAIT duration"],
+    ]:
+        inputs.append(row)
 
-    for ws in (ws_help, ws_data):
-        for row in ws.iter_rows():
+    outputs.append(["name", "width", "default", "description"])
+    for row in [
+        ["busy", "1", "1'b0", "FSM is processing"],
+        ["done", "1", "1'b0", "One-cycle completion indication"],
+        ["error", "1", "1'b0", "Abort/error indication"],
+    ]:
+        outputs.append(row)
+
+    states.append(["state", "code", "timer_limit", "description"])
+    for row in [
+        ["IDLE", "", "", "Wait for start"],
+        ["WAIT", "", "delay_cycles", "Timed processing state"],
+        ["DONE", "", "", "Report completion"],
+        ["ERROR", "", "", "Report abort/error"],
+    ]:
+        states.append(row)
+
+    transitions.append(["state", "condition", "next_state", "outputs", "description"])
+    for row in [
+        ["IDLE", "start", "WAIT", "busy=1'b1", "Start"],
+        ["IDLE", "default", "IDLE", "", "Stay idle"],
+        ["WAIT", "abort", "ERROR", "error=1'b1", "Abort has highest priority"],
+        ["WAIT", "timer_done", "DONE", "busy=1'b1", "Configured delay complete"],
+        ["WAIT", "default", "WAIT", "busy=1'b1", "Continue waiting"],
+        ["DONE", "default", "IDLE", "done=1'b1", "Pulse done and return"],
+        ["ERROR", "default", "IDLE", "error=1'b1", "Pulse error and return"],
+    ]:
+        transitions.append(row)
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    input_fill = PatternFill("solid", fgColor="FFF2CC")
+    error_fill = PatternFill("solid", fgColor="F4CCCC")
+    thin_border = Border(bottom=Side(style="thin", color="B7B7B7"))
+
+    sheet_setup = {
+        config: ([24, 28, 56], "4472C4"),
+        inputs: ([24, 12, 56], "70AD47"),
+        outputs: ([24, 12, 24, 56], "ED7D31"),
+        states: ([24, 18, 28, 56], "A64D79"),
+        transitions: ([24, 38, 24, 62, 56], "5B9BD5"),
+    }
+    header_help = {
+        config: [
+            "Configuration key. Keep the provided key names unchanged.",
+            "Value used by the generator. Yellow cells are editable.",
+            "Human-readable explanation; ignored by the generator.",
+        ],
+        inputs: [
+            "Valid Verilog input port name, for example start or data_valid.",
+            "Positive bit width. Use 1 for a scalar and 8 for [7:0].",
+            "Optional note for reviewers; ignored by the generator.",
+        ],
+        outputs: [
+            "Valid Verilog output port name, for example busy or done.",
+            "Positive bit width. Use 1 for a scalar and 8 for [7:0].",
+            "Combinational default, for example 1'b0 or 8'h00.",
+            "Optional note for reviewers; ignored by the generator.",
+        ],
+        states: [
+            "Unique Verilog state name. Duplicate names are highlighted red.",
+            "Optional explicit encoding, for example 3'b010. Leave blank for automatic encoding.",
+            "Optional number/expression of cycles in this state, for example 16 or delay_cycles.",
+            "Optional state purpose; ignored by the generator.",
+        ],
+        transitions: [
+            "Current state. Select a name defined in the States sheet.",
+            "Verilog condition or default. Rows are evaluated top-to-bottom; put default last.",
+            "Destination state. Select a name defined in the States sheet.",
+            "Optional branch assignments separated by semicolons, for example busy=1'b1;done=1'b0.",
+            "Optional transition purpose; ignored by the generator.",
+        ],
+    }
+    for ws, (widths, tab_color) in sheet_setup.items():
+        ws.freeze_panes = "A2"
+        editable_rows = 500 if ws is transitions else 200
+        last_column = get_column_letter(len(widths))
+        ws.auto_filter.ref = f"A1:{last_column}{editable_rows}"
+        ws.sheet_properties.tabColor = tab_color
+        for index, cell in enumerate(ws[1]):
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.comment = Comment(header_help[ws][index], "FSM Generator")
+        for row in ws.iter_rows(min_row=2, max_row=editable_rows, max_col=len(widths)):
             for cell in row:
+                cell.fill = input_fill
+                cell.border = thin_border
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
+        for index, width in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(index)].width = width
+
+    guide.sheet_properties.tabColor = "00B0F0"
+    guide.column_dimensions["A"].width = 24
+    guide.column_dimensions["B"].width = 110
+    guide["A1"].font = Font(bold=True, size=16, color="FFFFFF")
+    guide["B1"].font = Font(bold=True, size=12, color="FFFFFF")
+    guide["A1"].fill = header_fill
+    guide["B1"].fill = header_fill
+    for row in guide.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            cell.border = thin_border
+
+    bool_validation = DataValidation(type="list", formula1='"true,false"', allow_blank=False)
+    config.add_data_validation(bool_validation)
+    bool_validation.add(config["B5"])
+
+    width_validation = DataValidation(type="list", formula1='"1,2,4,8,16,32,64"', allow_blank=False)
+    width_validation.errorStyle = "warning"
+    width_validation.error = "Choose a common width or type another positive width."
+    for ws, column in ((inputs, "B"), (outputs, "B")):
+        ws.add_data_validation(width_validation)
+        width_validation.add(f"{column}2:{column}200")
+
+    state_names = DefinedName("StateNames", attr_text="'States'!$A$2:$A$200")
+    wb.defined_names.add(state_names)
+    state_validation = DataValidation(type="list", formula1="=StateNames", allow_blank=False)
+    transitions.add_data_validation(state_validation)
+    state_validation.add("A2:A500")
+    next_state_validation = DataValidation(type="list", formula1="=StateNames", allow_blank=False)
+    transitions.add_data_validation(next_state_validation)
+    next_state_validation.add("C2:C500")
+    reset_state_validation = DataValidation(type="list", formula1="=StateNames", allow_blank=False)
+    config.add_data_validation(reset_state_validation)
+    reset_state_validation.add(config["B6"])
+
+    duplicate_state_rule = FormulaRule(formula=["COUNTIF($A$2:$A$200,A2)>1"], fill=error_fill)
+    states.conditional_formatting.add("A2:A200", duplicate_state_rule)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
@@ -298,7 +423,17 @@ def load_sheets(path: Path, template_path: Optional[Path], sheet_name: Optional[
             if template_path:
                 template = template_path.read_text(encoding="utf-8")
             return sheets, template or DEFAULT_TEMPLATE
-        known = {"meta", "states", "inputs", "outputs", "transitions", "template"}
+        known = {
+            "meta",
+            "config",
+            "states",
+            "inputs",
+            "outputs",
+            "transitions",
+            "template",
+            "guide",
+            "lists",
+        }
         data_sheets = [name for name, rows in sheets.items() if name not in known and rows]
         if "transitions" not in sheets and len(data_sheets) == 1:
             sheets = {"table": sheets[data_sheets[0]]}
@@ -363,6 +498,14 @@ def parse_meta(rows: List[Dict[str, str]], fallback_module: str) -> Dict[str, st
         "next_state_name": "next_state",
         "encoding": "binary",
         "output_file": "",
+        "timer_width": "32",
+        "timer_counter_name": "state_timer",
+        "timer_done_name": "timer_done",
+        "timer_active_name": "timer_active",
+        "language": "systemverilog",
+        "reset_type": "async",
+        "clock_enable": "",
+        "assertions": "true",
     }
     for row in rows:
         key = pick(row, "key", "name")
@@ -442,6 +585,14 @@ def build_single_table_spec(rows: List[Dict[str, str]], fallback_module: str, te
         "state_reg_name",
         "next_state_name",
         "output_file",
+        "timer_width",
+        "timer_counter_name",
+        "timer_done_name",
+        "timer_active_name",
+        "language",
+        "reset_type",
+        "clock_enable",
+        "assertions",
     ):
         value = first_non_empty(rows, key)
         if value:
@@ -449,14 +600,30 @@ def build_single_table_spec(rows: List[Dict[str, str]], fallback_module: str, te
 
     transitions = parse_transitions(rows)
 
-    state_rows = []
-    seen_state_rows = set()
+    state_rows_by_name: Dict[str, Dict[str, str]] = {}
     for row in rows:
         state = pick(row, "state", "current_state", "current")
         code = pick(row, "state_code", "code", "encoding")
-        if state and state not in seen_state_rows:
-            seen_state_rows.add(state)
-            state_rows.append({"state": state, "code": code})
+        timer_limit = pick(row, "timer_limit", "duration", "cycles")
+        if not state:
+            continue
+        if state not in state_rows_by_name:
+            state_rows_by_name[state] = {
+                "state": state,
+                "code": code,
+                "timer_limit": timer_limit,
+            }
+            continue
+        state_row = state_rows_by_name[state]
+        if code:
+            if state_row["code"] and state_row["code"] != code:
+                die(f"State '{state}' has conflicting state_code values")
+            state_row["code"] = code
+        if timer_limit:
+            if state_row["timer_limit"] and state_row["timer_limit"] != timer_limit:
+                die(f"State '{state}' has conflicting timer_limit values")
+            state_row["timer_limit"] = timer_limit
+    state_rows = list(state_rows_by_name.values())
     states = parse_states(state_rows, transitions)
 
     input_text = first_non_empty(rows, "inputs", "input_list")
@@ -524,15 +691,24 @@ def parse_transitions(rows: List[Dict[str, str]]) -> List[Transition]:
 def parse_states(rows: List[Dict[str, str]], transitions: List[Transition]) -> List[State]:
     raw_states = []
     codes: Dict[str, str] = {}
+    timer_limits: Dict[str, str] = {}
 
     for idx, row in enumerate(rows, start=2):
         name = pick(row, "state", "name")
         if not name:
             continue
-        raw_states.append(name)
+        if name not in raw_states:
+            raw_states.append(name)
         code = pick(row, "code", "encoding")
         if code:
+            if name in codes and codes[name] != code:
+                die(f"State '{name}' has conflicting state encoding values")
             codes[name] = code
+        timer_limit = pick(row, "timer_limit", "duration", "cycles")
+        if timer_limit:
+            if name in timer_limits and timer_limits[name] != timer_limit:
+                die(f"State '{name}' has conflicting timer_limit values")
+            timer_limits[name] = timer_limit
 
     if not raw_states:
         for tr in transitions:
@@ -550,7 +726,14 @@ def parse_states(rows: List[Dict[str, str]], transitions: List[Transition]) -> L
         if ident in used_idents:
             die(f"Duplicate state identifier after sanitize: {ident}")
         used_idents.add(ident)
-        states.append(State(raw_name=raw, ident=ident, code=codes.get(raw)))
+        states.append(
+            State(
+                raw_name=raw,
+                ident=ident,
+                code=codes.get(raw),
+                timer_limit=timer_limits.get(raw),
+            )
+        )
 
     return states
 
@@ -562,7 +745,7 @@ def build_spec(path: Path, template_path: Optional[Path], sheet_name: Optional[s
         return build_single_table_spec(sheets["table"], fallback_module, template)
     transitions = parse_transitions(sheets.get("transitions", []))
     states = parse_states(sheets.get("states", []), transitions)
-    meta = parse_meta(sheets.get("meta", []), fallback_module)
+    meta = parse_meta(sheets.get("meta", sheets.get("config", [])), fallback_module)
     inputs = parse_fields(sheets.get("inputs", []), "input")
     outputs = parse_fields(sheets.get("outputs", []), "output")
     return Spec(meta=meta, states=states, inputs=inputs, outputs=outputs, transitions=transitions, template=template)
@@ -585,14 +768,42 @@ def state_width(spec: Spec) -> int:
                 coded_width = max(coded_width, int(match.group(1)))
     if coded_width:
         return coded_width
+    encoding = spec.meta.get("encoding", "binary").strip().lower()
+    if encoding == "onehot":
+        return max(1, len(spec.states))
     return max(1, math.ceil(math.log2(max(1, len(spec.states)))))
 
 
 def assign_state_codes(spec: Spec) -> None:
     width = state_width(spec)
+    encoding = spec.meta.get("encoding", "binary").strip().lower()
     for idx, state in enumerate(spec.states):
         if not state.code:
-            state.code = f"{width}'d{idx}"
+            if encoding == "onehot":
+                state.code = f"{width}'b{1 << idx:0{width}b}"
+            elif encoding == "gray":
+                state.code = f"{width}'d{idx ^ (idx >> 1)}"
+            else:
+                state.code = f"{width}'d{idx}"
+
+
+def timed_states(spec: Spec) -> List[State]:
+    return [state for state in spec.states if state.timer_limit]
+
+
+def parse_bool(value: str, default: bool = False) -> bool:
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    die(f"Expected a boolean value, got '{value}'")
+
+
+def is_systemverilog(spec: Spec) -> bool:
+    return spec.meta.get("language", "systemverilog") == "systemverilog"
 
 
 def validate_spec(spec: Spec) -> None:
@@ -606,6 +817,98 @@ def validate_spec(spec: Spec) -> None:
     require_ident(spec.meta["reset"], "meta.reset")
     require_ident(spec.meta["state_reg_name"], "meta.state_reg_name")
     require_ident(spec.meta["next_state_name"], "meta.next_state_name")
+
+    language = spec.meta.get("language", "systemverilog").strip().lower()
+    language_aliases = {
+        "sv": "systemverilog",
+        "systemverilog": "systemverilog",
+        "v": "verilog",
+        "verilog": "verilog",
+        "verilog-2001": "verilog",
+    }
+    if language not in language_aliases:
+        die("language must be systemverilog or verilog")
+    spec.meta["language"] = language_aliases[language]
+
+    encoding = spec.meta.get("encoding", "binary").strip().lower()
+    if encoding not in ("binary", "onehot", "gray"):
+        die("encoding must be binary, onehot, or gray")
+    spec.meta["encoding"] = encoding
+
+    reset_type = spec.meta.get("reset_type", "async").strip().lower()
+    if reset_type not in ("async", "sync"):
+        die("reset_type must be async or sync")
+    spec.meta["reset_type"] = reset_type
+    parse_bool(spec.meta.get("reset_active_low", "true"), default=True)
+    parse_bool(spec.meta.get("assertions", "true"), default=True)
+
+    clock_enable = spec.meta.get("clock_enable", "").strip()
+    if clock_enable:
+        require_ident(clock_enable, "meta.clock_enable")
+        spec.meta["clock_enable"] = clock_enable
+
+    port_names = [spec.meta["clock"], spec.meta["reset"]]
+    port_names.extend(item.name for item in spec.inputs)
+    port_names.extend(item.name for item in spec.outputs)
+    duplicates = sorted({name for name in port_names if port_names.count(name) > 1})
+    if duplicates:
+        die(f"Duplicate port name: {', '.join(duplicates)}")
+    clock_enable_conflicts = {
+        spec.meta["clock"],
+        spec.meta["reset"],
+        *(item.name for item in spec.outputs),
+    }
+    if clock_enable and clock_enable in clock_enable_conflicts:
+        die(f"clock_enable conflicts with existing port '{clock_enable}'")
+
+    try:
+        timer_width = int(spec.meta.get("timer_width", "32"), 10)
+    except ValueError:
+        die("timer_width must be a positive decimal integer")
+    if timer_width < 1:
+        die("timer_width must be a positive decimal integer")
+
+    for state in timed_states(spec):
+        limit = str(state.timer_limit).strip()
+        if re.fullmatch(r"-\d+", limit):
+            die(f"State '{state.raw_name}' has a negative timer_limit")
+        if limit.isdigit() and int(limit, 10) > (1 << timer_width):
+            die(
+                f"State '{state.raw_name}' timer_limit {limit} does not fit "
+                f"timer_width {timer_width}"
+            )
+
+    if timed_states(spec):
+        timer_names = [
+            spec.meta["timer_counter_name"],
+            spec.meta["timer_done_name"],
+            spec.meta["timer_active_name"],
+            "TIMER_W",
+        ]
+        for name in timer_names:
+            require_ident(name, "timer metadata")
+        if len(set(timer_names)) != len(timer_names):
+            die("Timer internal names must be unique and cannot use the reserved name TIMER_W")
+        used_names = {
+            spec.meta["clock"],
+            spec.meta["reset"],
+            spec.meta["state_reg_name"],
+            spec.meta["next_state_name"],
+            *(item.name for item in spec.inputs),
+            *(item.name for item in spec.outputs),
+            *(state.ident for state in spec.states),
+        }
+        conflicts = sorted(set(timer_names) & used_names)
+        if conflicts:
+            die(f"Timer internal name conflicts with an existing signal: {', '.join(conflicts)}")
+
+        required_placeholders = ("{{timer_declarations}}", "{{timer_block}}")
+        missing = [item for item in required_placeholders if item not in spec.template]
+        if missing:
+            die(
+                "Timed states require timer placeholders in the Verilog template: "
+                + ", ".join(missing)
+            )
 
     lookup = state_lookup(spec)
     reset_state = spec.meta.get("reset_state", "")
@@ -639,6 +942,10 @@ def validate_spec(spec: Spec) -> None:
             seen_condition.add(cond_key)
 
     assign_state_codes(spec)
+    codes = [state.code.strip().lower() for state in spec.states if state.code]
+    duplicate_codes = sorted({code for code in codes if codes.count(code) > 1})
+    if duplicate_codes:
+        die(f"Duplicate state encoding: {', '.join(duplicate_codes)}")
 
 
 def indent(text: str, spaces: int) -> str:
@@ -647,13 +954,19 @@ def indent(text: str, spaces: int) -> str:
 
 
 def render_ports(spec: Spec) -> str:
+    net_type = "logic" if is_systemverilog(spec) else "wire"
+    output_type = "logic" if is_systemverilog(spec) else "reg"
     ports = []
-    ports.append(f"  input wire {spec.meta['clock']}")
-    ports.append(f"  input wire {spec.meta['reset']}")
+    ports.append(f"  input {net_type} {spec.meta['clock']}")
+    ports.append(f"  input {net_type} {spec.meta['reset']}")
+    clock_enable = spec.meta.get("clock_enable", "")
+    input_names = {item.name for item in spec.inputs}
+    if clock_enable and clock_enable not in input_names:
+        ports.append(f"  input {net_type} {clock_enable}")
     for item in spec.inputs:
-        ports.append(f"  input wire{item.decl_width} {item.name}")
+        ports.append(f"  input {net_type}{item.decl_width} {item.name}")
     for item in spec.outputs:
-        ports.append(f"  output reg{item.decl_width} {item.name}")
+        ports.append(f"  output {output_type}{item.decl_width} {item.name}")
     return ",\n".join(ports)
 
 
@@ -663,6 +976,31 @@ def render_state_localparams(spec: Spec) -> str:
     for state in spec.states:
         lines.append(f"localparam [STATE_W-1:0] {state.ident} = {state.code};")
     return "\n".join(lines)
+
+
+def render_state_declarations(spec: Spec) -> str:
+    if not is_systemverilog(spec):
+        return "\n".join(
+            [
+                render_state_localparams(spec),
+                "",
+                f"reg [STATE_W-1:0] {spec.meta['state_reg_name']};",
+                f"reg [STATE_W-1:0] {spec.meta['next_state_name']};",
+            ]
+        )
+    width = state_width(spec)
+    members = ",\n".join(f"  {state.ident} = {state.code}" for state in spec.states)
+    return "\n".join(
+        [
+            f"localparam int unsigned STATE_W = {width};",
+            "typedef enum logic [STATE_W-1:0] {",
+            members,
+            "} state_t;",
+            "",
+            f"state_t {spec.meta['state_reg_name']};",
+            f"state_t {spec.meta['next_state_name']};",
+        ]
+    )
 
 
 def active_reset_condition(spec: Spec) -> Tuple[str, str]:
@@ -679,17 +1017,103 @@ def render_state_register_block(spec: Spec, lookup: Dict[str, State]) -> str:
     next_state = spec.meta["next_state_name"]
     reset_state = lookup[spec.meta["reset_state"]].ident
     reset_edge, reset_cond = active_reset_condition(spec)
+    always_keyword = "always_ff" if is_systemverilog(spec) else "always"
+    sensitivity = f"posedge {clk}"
+    if spec.meta.get("reset_type", "async") == "async":
+        sensitivity += f" or {reset_edge}"
+    clock_enable = spec.meta.get("clock_enable", "")
+    lines = [f"{always_keyword} @({sensitivity}) begin", f"  if ({reset_cond}) begin"]
+    lines.extend([f"    {state_reg} <= {reset_state};", "  end"])
+    if clock_enable:
+        lines.extend([f"  else if ({clock_enable}) begin", f"    {state_reg} <= {next_state};", "  end"])
+    else:
+        lines.extend(["  else begin", f"    {state_reg} <= {next_state};", "  end"])
+    lines.append("end")
+    return "\n".join(lines)
+
+
+def render_timer_declarations(spec: Spec) -> str:
+    if not timed_states(spec):
+        return ""
+    width = int(spec.meta["timer_width"], 10)
+    counter = spec.meta["timer_counter_name"]
+    done = spec.meta["timer_done_name"]
+    active = spec.meta["timer_active_name"]
+    reg_type = "logic" if is_systemverilog(spec) else "reg"
+    param_type = "int unsigned" if is_systemverilog(spec) else "integer"
     return "\n".join(
         [
-            f"always @(posedge {clk} or {reset_edge}) begin",
-            f"  if ({reset_cond}) begin",
-            f"    {state_reg} <= {reset_state};",
-            "  end else begin",
-            f"    {state_reg} <= {next_state};",
-            "  end",
-            "end",
+            f"localparam {param_type} TIMER_W = {width};",
+            f"{reg_type} [TIMER_W-1:0] {counter};",
+            f"{reg_type} {done};",
+            f"{reg_type} {active};",
         ]
     )
+
+
+def render_timer_block(spec: Spec) -> str:
+    states = timed_states(spec)
+    if not states:
+        return ""
+
+    clk = spec.meta["clock"]
+    state_reg = spec.meta["state_reg_name"]
+    next_state = spec.meta["next_state_name"]
+    counter = spec.meta["timer_counter_name"]
+    done = spec.meta["timer_done_name"]
+    active = spec.meta["timer_active_name"]
+    reset_edge, reset_cond = active_reset_condition(spec)
+    seq_keyword = "always_ff" if is_systemverilog(spec) else "always"
+    comb_keyword = "always_comb" if is_systemverilog(spec) else "always @(*)"
+    sensitivity = f"posedge {clk}"
+    if spec.meta.get("reset_type", "async") == "async":
+        sensitivity += f" or {reset_edge}"
+    clock_enable = spec.meta.get("clock_enable", "")
+
+    lines = [f"{seq_keyword} @({sensitivity}) begin", f"  if ({reset_cond}) begin"]
+    lines.extend([f"    {counter} <= {{TIMER_W{{1'b0}}}};", "  end else begin"])
+    branch_indent = "    "
+    if clock_enable:
+        lines.append(f"    if ({clock_enable}) begin")
+        branch_indent = "      "
+    lines.extend(
+        [
+            f"{branch_indent}if ({state_reg} != {next_state}) begin",
+            f"{branch_indent}  {counter} <= {{TIMER_W{{1'b0}}}};",
+            f"{branch_indent}end else if ({active} && !{done}) begin",
+            f"{branch_indent}  {counter} <= {counter} + 1'b1;",
+            f"{branch_indent}end else if (!{active}) begin",
+            f"{branch_indent}  {counter} <= {{TIMER_W{{1'b0}}}};",
+            f"{branch_indent}end",
+        ]
+    )
+    if clock_enable:
+        lines.append("    end")
+    lines.extend([
+        "  end",
+        "end",
+        "",
+        f"{comb_keyword} begin",
+        f"  {active} = 1'b0;",
+        f"  {done} = 1'b0;",
+        "",
+        f"  {'unique ' if is_systemverilog(spec) else ''}case ({state_reg})",
+    ])
+    for state in states:
+        limit = state.timer_limit
+        lines.extend(
+            [
+                f"    {state.ident}: begin",
+                f"      {active} = 1'b1;",
+                f"      if (({limit}) <= 1)",
+                f"        {done} = 1'b1;",
+                "      else",
+                f"        {done} = ({counter} >= (({limit}) - 1'b1));",
+                "    end",
+            ]
+        )
+    lines.extend(["    default: begin", "    end", "  endcase", "end"])
+    return "\n".join(lines)
 
 
 def output_default_lines(spec: Spec, spaces: int = 2) -> List[str]:
@@ -736,11 +1160,12 @@ def render_comb_block(spec: Spec, lookup: Dict[str, State]) -> str:
     state_reg = spec.meta["state_reg_name"]
     next_state = spec.meta["next_state_name"]
     reset_state = lookup[spec.meta["reset_state"]].ident
-    lines = ["always @(*) begin"]
+    comb_keyword = "always_comb" if is_systemverilog(spec) else "always @(*)"
+    lines = [f"{comb_keyword} begin"]
     lines.append(f"  {next_state} = {state_reg};")
     lines.extend(output_default_lines(spec, 2))
     lines.append("")
-    lines.append(f"  case ({state_reg})")
+    lines.append(f"  {'unique ' if is_systemverilog(spec) else ''}case ({state_reg})")
     for state in spec.states:
         lines.append(render_state_branch(spec, state, spec.transitions, lookup))
     lines.append("    default: begin")
@@ -751,34 +1176,63 @@ def render_comb_block(spec: Spec, lookup: Dict[str, State]) -> str:
     return "\n".join(lines)
 
 
+def render_assertion_block(spec: Spec) -> str:
+    if not is_systemverilog(spec) or not parse_bool(spec.meta.get("assertions", "true"), default=True):
+        return ""
+    clk = spec.meta["clock"]
+    state_reg = spec.meta["state_reg_name"]
+    _, reset_cond = active_reset_condition(spec)
+    legal_states = ", ".join(state.ident for state in spec.states)
+    module_name = spec.meta["module_name"]
+    return "\n".join(
+        [
+            "`ifndef SYNTHESIS",
+            "// Simulation-only checks for X propagation and corrupted state encodings.",
+            f"assert property (@(posedge {clk}) disable iff ({reset_cond}) !$isunknown({state_reg}))",
+            f'  else $error("{module_name}: state contains X/Z");',
+            f"assert property (@(posedge {clk}) disable iff ({reset_cond}) {state_reg} inside {{{legal_states}}})",
+            f'  else $error("{module_name}: illegal state encoding");',
+            "`endif",
+        ]
+    )
+
+
 def render(spec: Spec) -> str:
     validate_spec(spec)
     lookup = state_lookup(spec)
+    template = spec.template
+    if template == DEFAULT_SYSTEMVERILOG_TEMPLATE and not is_systemverilog(spec):
+        template = DEFAULT_VERILOG_TEMPLATE
     replacements = {
         "module_name": spec.meta["module_name"],
         "port_declarations": render_ports(spec),
         "state_localparams": render_state_localparams(spec),
+        "state_declarations": render_state_declarations(spec),
         "state_reg_name": spec.meta["state_reg_name"],
         "next_state_name": spec.meta["next_state_name"],
+        "timer_declarations": render_timer_declarations(spec),
         "state_register_block": render_state_register_block(spec, lookup),
+        "timer_block": render_timer_block(spec),
         "comb_block": render_comb_block(spec, lookup),
+        "assertion_block": render_assertion_block(spec),
     }
-    text = spec.template
+    text = template
     for key, value in replacements.items():
         text = text.replace("{{" + key + "}}", value)
     return text.rstrip() + "\n"
 
 
 def write_output(spec: Spec, input_path: Path, out_arg: Optional[Path], text: str) -> Path:
+    extension = ".sv" if is_systemverilog(spec) else ".v"
     if out_arg:
         if out_arg.is_dir() or str(out_arg).endswith("/") or out_arg.suffix == "":
-            out_path = out_arg / f"{spec.meta['module_name']}.v"
+            out_path = out_arg / f"{spec.meta['module_name']}{extension}"
         else:
             out_path = out_arg
     elif spec.meta.get("output_file"):
         out_path = input_path.parent / spec.meta["output_file"]
     else:
-        out_path = Path.cwd() / f"{spec.meta['module_name']}.v"
+        out_path = Path.cwd() / f"{spec.meta['module_name']}{extension}"
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(text, encoding="utf-8")
@@ -786,24 +1240,39 @@ def write_output(spec: Spec, input_path: Path, out_arg: Optional[Path], text: st
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Generate a Verilog FSM from one CSV table or one XLSX data sheet.")
+    parser = argparse.ArgumentParser(
+        description="Generate a synthesizable SystemVerilog or Verilog FSM from CSV/XLSX."
+    )
     parser.add_argument("input", nargs="?", type=Path, help="Spec folder, .csv file, or .xlsx workbook")
-    parser.add_argument("-o", "--out", type=Path, help="Output .v file or output directory")
+    parser.add_argument("-o", "--out", type=Path, help="Output HDL file or output directory")
     parser.add_argument("--sheet", help="Data sheet name for .xlsx, folder CSV, or CSV files with a sheet column")
     parser.add_argument("--template", type=Path, help="Optional template file overriding template sheet")
-    parser.add_argument("--print", action="store_true", help="Print generated Verilog to stdout")
-    parser.add_argument("--new-adc-template", type=Path, help="Create an ADC controller workbook template and exit")
+    parser.add_argument("--print", action="store_true", help="Print generated RTL to stdout")
+    parser.add_argument(
+        "--language",
+        choices=("systemverilog", "verilog"),
+        help="Override Config.language (default: systemverilog)",
+    )
+    parser.add_argument(
+        "--new-template",
+        "--new-adc-template",
+        dest="new_template",
+        type=Path,
+        help="Create a generic FSM workbook template and exit",
+    )
     args = parser.parse_args(argv)
 
-    if args.new_adc_template:
-        create_adc_template(args.new_adc_template)
-        print(f"Created {args.new_adc_template}")
+    if args.new_template:
+        create_fsm_template(args.new_template)
+        print(f"Created {args.new_template}")
         return 0
 
     if not args.input:
-        parser.error("input is required unless --new-adc-template is used")
+        parser.error("input is required unless --new-template is used")
 
     spec = build_spec(args.input, args.template, args.sheet)
+    if args.language:
+        spec.meta["language"] = args.language
     text = render(spec)
     if args.print:
         print(text, end="")
